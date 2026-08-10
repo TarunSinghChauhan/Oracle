@@ -78,6 +78,23 @@ with tracer.span("agent_run", kind="agent_run") as run:
 Every span is written to SQLite immediately — no batching, no buffering,
 so you can query `oracle_traces.db` mid-run.
 
+See `examples/instrument_agent.py` for a complete runnable example
+(LLM call → tool call → LLM call), then launch the dashboard to watch
+it show up live.
+
+## Dashboard
+
+A local Flask console reads directly from `TraceStore` — no external
+services, no keys:
+
+```bash
+python -m oracle.simulator      # or examples/instrument_agent.py for real-shaped data
+python dashboard/app.py
+```
+
+Open `http://127.0.0.1:5050` to see live spans, run stats, and an
+anomaly feed.
+
 ## Anomaly detection
 
 Rolling z-score baselines per span `name`, no LLM judge required:
