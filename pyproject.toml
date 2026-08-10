@@ -1,0 +1,19 @@
+[project]
+name = "oracle"
+version = "0.1.0"
+description = "Observability & anomaly detection for LLM agents — the Batcomputer for your agent fleet."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["oracle*"]
