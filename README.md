@@ -105,6 +105,23 @@ Rolling z-score baselines per span `name`, no LLM judge required:
 
 Thresholds are configurable (`AnomalyDetector(latency_z_threshold=3.0, ...)`).
 
+## Drift detection
+
+Separately, `DriftDetector` watches an LLM call's **output text** itself —
+not just timing/cost — using word-shingle Jaccard similarity against a
+rolling window of recent outputs for that span name. No embeddings API
+required. Catches cases like a prompt suddenly producing wildly different
+output shape/topic (broken prompt, silent model swap, upstream data drift).
+
+```python
+from oracle.drift import DriftDetector
+
+detector = DriftDetector(window=10, min_samples=3)
+result = detector.check(span_id, "summarize_call", output_text)
+if result:
+    print(f"[{result.severity}] {result.message}")
+```
+
 ## Alerting
 
 ```python
@@ -130,8 +147,8 @@ z-score edge cases (including zero-variance baselines), and alert dispatch.
 
 ## Roadmap
 
-- [ ] Live dashboard (the "Batcomputer console") reading from `TraceStore`
-- [ ] Drift detection on LLM output text (embedding distance vs. baseline)
+- [x] Live dashboard (the "Batcomputer console") reading from `TraceStore`
+- [x] Drift detection on LLM output text (lexical similarity vs. baseline)
 - [ ] Ingestion adapters for LangChain/LangGraph callback handlers
 - [ ] Optional LLM-powered plain-English anomaly explanations (bolt-on, not core)
 
