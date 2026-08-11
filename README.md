@@ -82,6 +82,27 @@ See `examples/instrument_agent.py` for a complete runnable example
 (LLM call → tool call → LLM call), then launch the dashboard to watch
 it show up live.
 
+## LangChain / LangGraph integration
+
+For existing LangChain or LangGraph pipelines, skip manual instrumentation
+entirely — attach `OracleCallbackHandler` and every LLM call, tool call,
+and chain/agent step gets traced automatically:
+
+```python
+from oracle.storage import TraceStore
+from oracle.tracer import Tracer
+from oracle.integrations.langchain import OracleCallbackHandler
+
+store = TraceStore("oracle_traces.db")
+tracer = Tracer(store=store)
+handler = OracleCallbackHandler(tracer)
+
+chain.invoke({"input": "..."}, config={"callbacks": [handler]})
+```
+
+Requires `pip install langchain-core` — this is an optional dependency;
+core ORACLE never requires it.
+
 ## Dashboard
 
 A local Flask console reads directly from `TraceStore` — no external
@@ -149,7 +170,7 @@ z-score edge cases (including zero-variance baselines), and alert dispatch.
 
 - [x] Live dashboard (the "Batcomputer console") reading from `TraceStore`
 - [x] Drift detection on LLM output text (lexical similarity vs. baseline)
-- [ ] Ingestion adapters for LangChain/LangGraph callback handlers
+- [x] Ingestion adapter for LangChain/LangGraph callback handlers
 - [ ] Optional LLM-powered plain-English anomaly explanations (bolt-on, not core)
 
 ## Status

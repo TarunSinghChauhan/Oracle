@@ -1,2 +1,5 @@
 pytest>=7.0
 flask>=3.0
+
+# Optional, only needed for oracle.integrations.langchain
+# pip install langchain-core
