@@ -44,9 +44,10 @@ class AnomalyDetector:
         mean = statistics.mean(samples)
         stdev = statistics.pstdev(samples)
         if stdev == 0:
-            # Zero-variance baseline: any deviation is infinitely
-            # anomalous, no deviation is not anomalous at all.
-            return 0.0 if value == mean else float("inf")
+            # Zero-variance baseline: any value above the mean is infinitely
+            # anomalous. Both callers flag upward spikes only, so a value at
+            # or below the mean (a faster or cheaper span) is not anomalous.
+            return float("inf") if value > mean else 0.0
         return (value - mean) / stdev
 
     def check_latency(self, span: dict, history: list[dict]) -> Optional[Anomaly]:
