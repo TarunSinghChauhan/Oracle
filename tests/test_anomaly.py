@@ -63,3 +63,36 @@ def test_zero_stdev_returns_zero_zscore():
     history = [_mk_span(f"h{i}", duration_ms=100.0) for i in range(5)]
     same = _mk_span("s1", duration_ms=100.0)
     assert det.check_latency(same, history) is None
+
+
+def test_zero_variance_baseline_flags_slower_span():
+    det = AnomalyDetector(min_samples=3)
+    history = [_mk_span(f"h{i}", duration_ms=100.0) for i in range(5)]
+    slow = _mk_span("s1", duration_ms=500.0)
+    result = det.check_latency(slow, history)
+    assert result is not None
+    assert result.kind == "latency_spike"
+    assert result.severity == "critical"
+
+
+def test_zero_variance_baseline_ignores_faster_span():
+    det = AnomalyDetector(min_samples=3)
+    history = [_mk_span(f"h{i}", duration_ms=100.0) for i in range(5)]
+    fast = _mk_span("s1", duration_ms=10.0)
+    assert det.check_latency(fast, history) is None
+
+
+def test_zero_variance_baseline_flags_costlier_span():
+    det = AnomalyDetector(min_samples=3)
+    history = [_mk_span(f"h{i}", cost=0.01) for i in range(5)]
+    pricey = _mk_span("s1", cost=0.5)
+    result = det.check_cost(pricey, history)
+    assert result is not None
+    assert result.kind == "cost_spike"
+
+
+def test_zero_variance_baseline_ignores_cheaper_span():
+    det = AnomalyDetector(min_samples=3)
+    history = [_mk_span(f"h{i}", cost=0.01) for i in range(5)]
+    cheap = _mk_span("s1", cost=0.0)
+    assert det.check_cost(cheap, history) is None
