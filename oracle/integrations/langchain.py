@@ -120,7 +120,9 @@ class OracleCallbackHandler(BaseCallbackHandler):
     # --- Chain / agent events ---------------------------------------------
 
     def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, **kwargs):
-        name = (serialized or {}).get("name", "chain_run")
+        # Recent langchain-core passes `serialized=None` for chains and delivers
+        # the run name (a node name, or `run_name`) via the `name` kwarg.
+        name = kwargs.get("name") or (serialized or {}).get("name") or "chain_run"
         self._start(
             run_id, parent_run_id, name, kind="agent_run",
             attributes={},
