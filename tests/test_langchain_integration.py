@@ -6,6 +6,7 @@ import pytest
 langchain_core = pytest.importorskip("langchain_core")
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
 
 from oracle.tracer import Tracer
@@ -85,3 +86,42 @@ def test_import_error_message_is_clear():
     """The module should be importable when langchain-core is present."""
     from oracle.integrations.langchain import OracleCallbackHandler
     assert OracleCallbackHandler is not None
+
+
+def test_chain_span_uses_run_name(store):
+    tracer = Tracer(store=store)
+    handler = OracleCallbackHandler(tracer)
+    chain = RunnableLambda(lambda x: x).with_config(run_name="prepare_input")
+
+    chain.invoke("hi", config={"callbacks": [handler]})
+
+    names = [s["name"] for s in store.get_spans(kind="agent_run")]
+    assert names == ["prepare_input"]
+
+
+def test_chain_spans_keep_distinct_names_and_nesting(store):
+    tracer = Tracer(store=store)
+    handler = OracleCallbackHandler(tracer)
+    chain = (
+        RunnableLambda(lambda x: x).with_config(run_name="step_one")
+        | RunnableLambda(lambda x: x).with_config(run_name="step_two")
+    )
+
+    chain.invoke("hi", config={"callbacks": [handler]})
+
+    spans = store.get_spans(kind="agent_run")
+    by_name = {s["name"]: s for s in spans}
+    assert {"step_one", "step_two"} <= set(by_name)
+    assert "chain_run" not in by_name
+    outer = by_name["RunnableSequence"]
+    assert by_name["step_one"]["parent_id"] == outer["span_id"]
+    assert by_name["step_two"]["parent_id"] == outer["span_id"]
+
+
+def test_chain_start_falls_back_to_serialized_name_then_default():
+    handler = OracleCallbackHandler(Tracer())
+    handler.on_chain_start({"name": "legacy_chain"}, {}, run_id="r1")
+    handler.on_chain_start(None, {}, run_id="r2")
+
+    assert handler._spans["r1"].name == "legacy_chain"
+    assert handler._spans["r2"].name == "chain_run"
