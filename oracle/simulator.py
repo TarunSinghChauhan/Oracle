@@ -17,6 +17,11 @@ from oracle.storage import TraceStore
 TOOL_NAMES = ["web_search", "code_exec", "file_read", "vector_lookup"]
 LLM_MODELS = ["claude-sonnet", "claude-haiku", "gpt-4o-mini"]
 
+# Simulated LLM latency is `base_latency * LATENCY_SCALE` seconds. Scaling (rather
+# than capping) keeps injected anomalies proportionally slower than normal calls
+# while a demo run still finishes quickly.
+LATENCY_SCALE = 0.1
+
 
 def _simulate_llm_call(tracer: Tracer, parent, inject_anomaly: bool = False):
     base_latency = random.uniform(0.05, 0.25)
@@ -35,7 +40,7 @@ def _simulate_llm_call(tracer: Tracer, parent, inject_anomaly: bool = False):
             "cost_usd": round(base_cost, 5),
         },
     ):
-        time.sleep(min(base_latency, 0.02))  # capped so demo runs fast
+        time.sleep(base_latency * LATENCY_SCALE)
 
 
 def _simulate_tool_call(tracer: Tracer, parent, force_error: bool = False):
