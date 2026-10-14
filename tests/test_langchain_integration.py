@@ -125,3 +125,108 @@ def test_chain_start_falls_back_to_serialized_name_then_default():
 
     assert handler._spans["r1"].name == "legacy_chain"
     assert handler._spans["r2"].name == "chain_run"
+
+
+def test_tool_error_marks_span_as_error(store):
+    tracer = Tracer(store=store)
+    handler = OracleCallbackHandler(tracer)
+
+    @tool
+    def explode(x: int) -> int:
+        """Always fails."""
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError):
+        explode.invoke({"x": 1}, config={"callbacks": [handler]})
+
+    spans = store.get_spans(kind="tool_call")
+    assert len(spans) == 1
+    assert spans[0]["status"] == "error"
+    assert spans[0]["error"] == "boom"
+    assert handler._open_spans == {} and handler._spans == {}
+
+
+def test_chain_error_marks_span_as_error(store):
+    tracer = Tracer(store=store)
+    handler = OracleCallbackHandler(tracer)
+
+    def fail(_):
+        raise RuntimeError("chain broke")
+
+    chain = RunnableLambda(fail).with_config(run_name="flaky_step")
+
+    with pytest.raises(RuntimeError):
+        chain.invoke("hi", config={"callbacks": [handler]})
+
+    spans = store.get_spans(kind="agent_run")
+    assert [(s["name"], s["status"], s["error"]) for s in spans] == [
+        ("flaky_step", "error", "chain broke")
+    ]
+
+
+def test_llm_error_marks_span_as_error(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_llm_start({"name": "fake"}, ["p"], run_id="r1")
+    handler.on_llm_error(TimeoutError("rate limited"), run_id="r1")
+
+    spans = store.get_spans(kind="llm_call")
+    assert len(spans) == 1
+    assert spans[0]["status"] == "error"
+    assert spans[0]["error"] == "rate limited"
+    assert handler._spans == {}
+
+
+def test_llm_start_records_model_and_prompt_count(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_llm_start({"name": "gpt-x"}, ["a", "b"], run_id="r1")
+    handler.on_llm_end(object(), run_id="r1")
+
+    attrs = store.get_spans(kind="llm_call")[0]["attributes"]
+    assert attrs == {"model": "gpt-x", "prompt_count": 2}
+
+
+def test_chat_model_start_defaults_model_name(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_chat_model_start(None, [[]], run_id="r1")
+    handler.on_llm_end(object(), run_id="r1")
+
+    assert store.get_spans(kind="llm_call")[0]["attributes"] == {"model": "unknown_model"}
+
+
+def test_llm_end_records_total_tokens(store):
+    from types import SimpleNamespace
+
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_llm_start({"name": "m"}, ["p"], run_id="r1")
+    response = SimpleNamespace(llm_output={"token_usage": {"total_tokens": 42}})
+    handler.on_llm_end(response, run_id="r1")
+
+    assert store.get_spans(kind="llm_call")[0]["attributes"]["tokens"] == 42
+
+
+def test_tool_start_defaults_tool_name(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_tool_start(None, "input", run_id="r1")
+    handler.on_tool_end("out", run_id="r1")
+
+    assert store.get_spans(kind="tool_call")[0]["attributes"] == {"tool": "unknown_tool"}
+
+
+def test_ending_an_unknown_run_is_a_noop(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_tool_end("out", run_id="never-started")
+    handler.on_chain_error(ValueError("x"), run_id="never-started")
+
+    assert store.get_spans() == []
+
+
+def test_nested_llm_span_is_parented_to_chain_span(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    handler.on_chain_start(None, {}, run_id="chain", name="pipeline")
+    handler.on_llm_start({"name": "m"}, ["p"], run_id="llm", parent_run_id="chain")
+    handler.on_llm_end(object(), run_id="llm", parent_run_id="chain")
+    handler.on_chain_end({}, run_id="chain")
+
+    chain = store.get_spans(kind="agent_run")[0]
+    llm = store.get_spans(kind="llm_call")[0]
+    assert llm["parent_id"] == chain["span_id"]
