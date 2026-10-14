@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -38,11 +39,19 @@ class TraceStore:
     def __init__(self, db_path: str = "oracle_traces.db"):
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True) if Path(db_path).parent != Path("") else None
-        self._conn = sqlite3.connect(db_path)
+        # Spans are written from whichever thread a callback fires on (e.g.
+        # LangChain runs sync handlers in a thread pool), so the connection
+        # must be shareable; the lock serialises access to it.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
     def save_span(self, span: Span) -> None:
+        with self._lock:
+            self._save_span(span)
+
+    def _save_span(self, span: Span) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO spans
                (span_id, trace_id, parent_id, name, kind, status,
@@ -81,14 +90,17 @@ class TraceStore:
         query += " ORDER BY start_time DESC LIMIT ?"
         params.append(limit)
 
-        cur = self._conn.execute(query, params)
-        cols = [c[0] for c in cur.description]
+        with self._lock:
+            cur = self._conn.execute(query, params)
+            cols = [c[0] for c in cur.description]
+            fetched = cur.fetchall()
         rows = []
-        for row in cur.fetchall():
+        for row in fetched:
             d = dict(zip(cols, row))
             d["attributes"] = json.loads(d["attributes"]) if d["attributes"] else {}
             rows.append(d)
         return rows
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
