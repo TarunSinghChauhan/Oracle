@@ -53,3 +53,35 @@ def test_separate_span_names_have_independent_history():
     result = det.check("b1", "translate", "totally unrelated content here now")
     # translate has no history yet, so no drift should fire
     assert result is None
+
+
+def test_text_shorter_than_one_shingle_compares_as_a_whole_phrase():
+    assert jaccard_similarity("ok done", "ok done") == 1.0
+    assert jaccard_similarity("ok done", "all good") == 0.0
+
+
+def test_short_text_never_matches_longer_text_by_accident():
+    assert jaccard_similarity("ok", "the quick brown fox jumps") == 0.0
+
+
+def test_empty_text_versus_non_empty_text_is_zero():
+    assert jaccard_similarity("", "some real output here") == 0.0
+    assert jaccard_similarity("some real output here", "") == 0.0
+
+
+def test_whitespace_only_text_counts_as_empty():
+    assert jaccard_similarity("   \n\t ", "") == 1.0
+
+
+def test_similarity_ignores_case_and_extra_whitespace():
+    assert jaccard_similarity("The  Quick brown FOX", "the quick   brown fox") == 1.0
+
+
+def test_detector_flags_output_that_goes_empty():
+    det = DriftDetector(window=10, min_samples=3, drift_threshold=0.5)
+    for i in range(4):
+        det.check(f"s{i}", "summarize", "the quarterly report shows revenue growth")
+    result = det.check("s4", "summarize", "")
+    assert result is not None
+    assert result.severity == "critical"
+    assert result.similarity == 0.0
