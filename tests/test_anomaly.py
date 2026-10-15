@@ -1,4 +1,11 @@
+import os
+import tempfile
+
+import pytest
+
 from oracle.anomaly import AnomalyDetector
+from oracle.storage import TraceStore
+from oracle.tracer import Span
 
 
 def _mk_span(span_id, name="llm_call", duration_ms=100.0, cost=0.005, status="ok"):
@@ -96,3 +103,95 @@ def test_zero_variance_baseline_ignores_cheaper_span():
     history = [_mk_span(f"h{i}", cost=0.01) for i in range(5)]
     cheap = _mk_span("s1", cost=0.0)
     assert det.check_cost(cheap, history) is None
+
+
+@pytest.fixture
+def store():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    s = TraceStore(path)
+    yield s
+    s.close()
+    os.remove(path)
+
+
+def _save(store, i, duration_ms=100.0, kind="llm_call", name="llm_call",
+          status="ok", cost=0.005):
+    """Save span number `i`; higher `i` means a later start_time (newer)."""
+    start = 1_000.0 + i
+    store.save_span(Span(
+        span_id=f"s{i}",
+        name=name,
+        start_time=start,
+        end_time=start + duration_ms / 1000.0,
+        trace_id="t",
+        kind=kind,
+        status=status,
+        attributes={"cost_usd": cost},
+    ))
+
+
+def _seed_baseline(store, n=10, offset=0, **kw):
+    # Small, non-zero spread so the baseline has a real standard deviation.
+    for i in range(n):
+        _save(store, offset + i, duration_ms=100.0 + i, cost=0.005 + i * 0.0001, **kw)
+
+
+def test_scan_returns_nothing_for_healthy_store(store):
+    _seed_baseline(store)
+    assert AnomalyDetector().scan(store) == []
+
+
+def test_scan_returns_nothing_for_empty_store(store):
+    assert AnomalyDetector().scan(store) == []
+
+
+def test_scan_flags_latency_spike_in_store(store):
+    _seed_baseline(store)
+    _save(store, 10, duration_ms=5000.0)
+
+    found = AnomalyDetector().scan(store)
+
+    assert [(a.kind, a.span_id) for a in found] == [("latency_spike", "s10")]
+    assert found[0].value == pytest.approx(5000.0)
+
+
+def test_scan_flags_cost_spike_in_store(store):
+    _seed_baseline(store)
+    _save(store, 10, cost=2.0)
+
+    found = AnomalyDetector().scan(store)
+
+    assert [(a.kind, a.span_id) for a in found] == [("cost_spike", "s10")]
+
+
+def test_scan_reports_error_burst(store):
+    for i in range(10):
+        _save(store, i, status="error" if i >= 3 else "ok")
+
+    found = AnomalyDetector().scan(store)
+
+    bursts = [a for a in found if a.kind == "error_burst"]
+    assert len(bursts) == 1
+    assert bursts[0].severity == "critical"
+    assert bursts[0].value == pytest.approx(0.7)
+
+
+def test_scan_kind_filter_limits_what_is_checked(store):
+    _seed_baseline(store, kind="tool_call", name="search")
+    _save(store, 10, duration_ms=5000.0, kind="tool_call", name="search")
+    _seed_baseline(store, offset=100, kind="llm_call", name="llm_call")
+    det = AnomalyDetector()
+
+    assert any(a.kind == "latency_spike" for a in det.scan(store, kind="tool_call"))
+    assert det.scan(store, kind="llm_call") == []
+
+
+def test_scan_does_not_judge_a_span_against_newer_history(store):
+    # The slow span is the *oldest*, so it has no prior history to be compared
+    # with and must not be flagged by a baseline built from later spans.
+    _save(store, 0, duration_ms=5000.0)
+    for i in range(1, 11):
+        _save(store, i, duration_ms=100.0 + i)
+
+    assert AnomalyDetector().scan(store) == []
