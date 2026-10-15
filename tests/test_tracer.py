@@ -55,3 +55,15 @@ def test_span_to_dict_includes_duration():
     d = s.to_dict()
     assert "duration_ms" in d
     assert d["name"] == "op"
+
+
+def test_unfinished_span_has_no_duration():
+    span = Span(span_id="s1", name="op", start_time=100.0)
+    assert span.end_time is None
+    assert span.duration_ms is None
+    assert span.to_dict()["duration_ms"] is None
+
+
+def test_finished_span_duration_is_in_milliseconds():
+    span = Span(span_id="s1", name="op", start_time=100.0, end_time=100.25)
+    assert span.duration_ms == pytest.approx(250.0)
