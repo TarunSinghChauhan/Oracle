@@ -7,8 +7,10 @@ threshold rules for latency, cost, and error-rate spikes.
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Optional
 
 
@@ -20,6 +22,38 @@ class Anomaly:
     message: str
     value: float
     baseline: float
+
+
+class _RunningStats:
+    """
+    Incremental mean / population stdev over a growing sample.
+
+    Sums are kept as exact fractions, so identical values give a variance of
+    exactly zero (the zero-variance case in ``_zscore`` depends on that) and
+    results do not drift the way float running sums do.
+    """
+
+    __slots__ = ("n", "_s1", "_s2")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self._s1 = Fraction(0)
+        self._s2 = Fraction(0)
+
+    def add(self, x: float) -> None:
+        x = Fraction(x)
+        self.n += 1
+        self._s1 += x
+        self._s2 += x * x
+
+    @property
+    def mean(self) -> float:
+        return float(self._s1 / self.n)
+
+    @property
+    def stdev(self) -> float:
+        mean = self._s1 / self.n
+        return math.sqrt(self._s2 / self.n - mean * mean)
 
 
 class AnomalyDetector:
@@ -41,8 +75,10 @@ class AnomalyDetector:
     def _zscore(self, value: float, samples: list[float]) -> Optional[float]:
         if len(samples) < self.min_samples:
             return None
-        mean = statistics.mean(samples)
-        stdev = statistics.pstdev(samples)
+        return self._zscore_from(value, statistics.mean(samples), statistics.pstdev(samples))
+
+    @staticmethod
+    def _zscore_from(value: float, mean: float, stdev: float) -> float:
         if stdev == 0:
             # Zero-variance baseline: any value above the mean is infinitely
             # anomalous. Both callers flag upward spikes only, so a value at
@@ -55,9 +91,14 @@ class AnomalyDetector:
             h["duration_ms"] for h in history
             if h["name"] == span["name"] and h["duration_ms"] is not None
         ]
+        if span["duration_ms"] is None:
+            return None
         z = self._zscore(span["duration_ms"], durations)
         if z is None or z < self.latency_z_threshold:
             return None
+        return self._latency_anomaly(span, z, statistics.mean(durations))
+
+    def _latency_anomaly(self, span: dict, z: float, baseline: float) -> Anomaly:
         return Anomaly(
             span_id=span["span_id"],
             kind="latency_spike",
@@ -65,7 +106,7 @@ class AnomalyDetector:
             message=f"'{span['name']}' took {span['duration_ms']:.0f}ms "
                     f"({z:.1f} std devs above baseline)",
             value=span["duration_ms"],
-            baseline=statistics.mean(durations),
+            baseline=baseline,
         )
 
     def check_cost(self, span: dict, history: list[dict]) -> Optional[Anomaly]:
@@ -79,6 +120,9 @@ class AnomalyDetector:
         z = self._zscore(cost, costs)
         if z is None or z < self.cost_z_threshold:
             return None
+        return self._cost_anomaly(span, cost, z, statistics.mean(costs))
+
+    def _cost_anomaly(self, span: dict, cost: float, z: float, baseline: float) -> Anomaly:
         return Anomaly(
             span_id=span["span_id"],
             kind="cost_spike",
@@ -86,7 +130,7 @@ class AnomalyDetector:
             message=f"'{span['name']}' cost ${cost:.4f} "
                     f"({z:.1f} std devs above baseline)",
             value=cost,
-            baseline=statistics.mean(costs),
+            baseline=baseline,
         )
 
     def check_error_burst(self, recent: list[dict], window: int = 20, rate_threshold: float = 0.3) -> Optional[Anomaly]:
@@ -108,13 +152,42 @@ class AnomalyDetector:
     def scan(self, store, kind: Optional[str] = None) -> list[Anomaly]:
         """Run all checks against everything currently in the store."""
         spans = store.get_spans(kind=kind, limit=2000)
-        anomalies: list[Anomaly] = []
-        for i, span in enumerate(spans):
-            history = spans[i + 1:]  # older spans (DESC order)
-            for check in (self.check_latency, self.check_cost):
-                result = check(span, history)
-                if result:
-                    anomalies.append(result)
+
+        # Walk oldest -> newest, judging each span against running stats of the
+        # older spans with the same name, then folding it into those stats.
+        # This is linear in the number of spans; re-reading the whole history
+        # for every span made a scan quadratic (seconds for 2000 spans, and the
+        # dashboard rescans every few seconds).
+        latency_stats: dict[str, _RunningStats] = {}
+        cost_stats: dict[str, _RunningStats] = {}
+        per_span: dict[int, list[Anomaly]] = {}
+        for i in range(len(spans) - 1, -1, -1):
+            span = spans[i]
+            lat = latency_stats.setdefault(span["name"], _RunningStats())
+            cst = cost_stats.setdefault(span["name"], _RunningStats())
+            found: list[Anomaly] = []
+
+            duration = span["duration_ms"]
+            if duration is not None:
+                if lat.n >= self.min_samples:
+                    z = self._zscore_from(duration, lat.mean, lat.stdev)
+                    if z >= self.latency_z_threshold:
+                        found.append(self._latency_anomaly(span, z, lat.mean))
+                lat.add(duration)
+
+            cost = span.get("attributes", {}).get("cost_usd")
+            if cost is not None:
+                if cst.n >= self.min_samples:
+                    z = self._zscore_from(cost, cst.mean, cst.stdev)
+                    if z >= self.cost_z_threshold:
+                        found.append(self._cost_anomaly(span, cost, z, cst.mean))
+                cst.add(cost)
+
+            if found:
+                per_span[i] = found
+
+        # Report newest first, as before.
+        anomalies: list[Anomaly] = [a for i in sorted(per_span) for a in per_span[i]]
         burst = self.check_error_burst(spans)
         if burst:
             anomalies.append(burst)

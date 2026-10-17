@@ -1,9 +1,12 @@
 import os
+import random
+import statistics
 import tempfile
+import time
 
 import pytest
 
-from oracle.anomaly import AnomalyDetector
+from oracle.anomaly import AnomalyDetector, _RunningStats
 from oracle.storage import TraceStore
 from oracle.tracer import Span
 
@@ -195,3 +198,98 @@ def test_scan_does_not_judge_a_span_against_newer_history(store):
         _save(store, i, duration_ms=100.0 + i)
 
     assert AnomalyDetector().scan(store) == []
+
+
+def test_scan_matches_checking_each_span_against_all_older_history(store):
+    # scan() keeps running per-name statistics instead of re-reading history for
+    # every span. It must report exactly what the per-span check_* methods
+    # report when each span is compared against every older span.
+    rng = random.Random(7)
+    for i in range(240):
+        name = rng.choice(["llm_call", "tool_call"])
+        if 100 <= i < 140:
+            duration, cost = 100.0, 0.005  # flat stretch: zero-variance baselines
+        else:
+            duration = rng.choice([100.0, 105.0, 110.0, 400.0])
+            cost = rng.choice([0.004, 0.005, 0.006, 0.09, None])
+        start = 1_000.0 + i
+        store.save_span(Span(
+            span_id=f"s{i}", name=name, start_time=start,
+            end_time=start + duration / 1000.0, trace_id="t", kind="llm_call",
+            attributes={} if cost is None else {"cost_usd": cost},
+        ))
+
+    det = AnomalyDetector()
+    spans = store.get_spans(limit=2000)  # newest first
+    expected = []
+    for i, span in enumerate(spans):
+        for check in (det.check_latency, det.check_cost):
+            found = check(span, spans[i + 1:])
+            if found:
+                expected.append(found)
+    burst = det.check_error_burst(spans)
+    if burst:
+        expected.append(burst)
+
+    assert expected, "fixture should produce some anomalies"
+    assert det.scan(store) == expected
+
+
+def test_scan_skips_unfinished_spans(store):
+    _seed_baseline(store)
+    store.save_span(Span(span_id="open", name="llm_call", start_time=2_000.0,
+                         trace_id="t", kind="llm_call"))  # never ended
+
+    assert AnomalyDetector().scan(store) == []
+    unfinished = store.get_spans(limit=1)[0]
+    assert unfinished["duration_ms"] is None
+    assert AnomalyDetector().check_latency(unfinished, store.get_spans()) is None
+
+
+def test_scan_cost_is_linear_in_span_count():
+    # Re-reading all older history for every span made scan() quadratic: about
+    # 2.4s for 2000 spans, and the dashboard rescans every few seconds. The
+    # linear version takes a few hundredths of a second.
+    rng = random.Random(1)
+
+    class ListStore:  # scan() only needs get_spans(); skip SQLite for speed
+        def __init__(self, spans):
+            self.spans = spans
+
+        def get_spans(self, kind=None, limit=1000):
+            return self.spans[:limit]
+
+    spans = [
+        {
+            "span_id": f"s{i}",
+            "name": rng.choice(["a", "b", "c"]),
+            "kind": "llm_call",
+            "status": "ok",
+            "duration_ms": rng.uniform(80, 120),
+            "attributes": {"cost_usd": rng.uniform(0.004, 0.006)},
+        }
+        for i in range(2000)
+    ]  # newest first, like TraceStore.get_spans
+
+    started = time.perf_counter()
+    AnomalyDetector().scan(ListStore(spans))
+    assert time.perf_counter() - started < 1.0
+
+
+def test_running_stats_match_statistics_module():
+    rng = random.Random(3)
+    values = [rng.uniform(0, 500) for _ in range(200)]
+    stats = _RunningStats()
+    for i, v in enumerate(values, start=1):
+        stats.add(v)
+        assert stats.n == i
+        assert stats.mean == pytest.approx(statistics.mean(values[:i]), rel=1e-12)
+        assert stats.stdev == pytest.approx(statistics.pstdev(values[:i]), rel=1e-9, abs=1e-12)
+
+
+def test_running_stats_identical_values_have_exactly_zero_stdev():
+    stats = _RunningStats()
+    for _ in range(50):
+        stats.add(0.1)  # not exactly representable; float running sums drift here
+    assert stats.stdev == 0.0
+    assert stats.mean == 0.1
