@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -64,3 +65,31 @@ def test_stats_on_empty_store(tmp_path):
         data = c.get("/api/stats").get_json()
         assert data["total_spans"] == 0
         assert data["total_cost_usd"] == 0
+
+
+def test_stats_count_every_span_not_just_the_newest_page(tmp_path):
+    # /api/stats used to be computed from the newest 5000 spans only, so a busy
+    # store reported 5000 spans and understated runs, errors and cost.
+    path = str(tmp_path / "busy.db")
+    store = TraceStore(path)
+    rows = [
+        (f"s{i}", "t", None, "op", "agent_run" if i % 10 == 0 else "llm_call",
+         "error" if i % 7 == 0 else "ok", 1_000.0 + i, 1_000.1 + i, 100.0,
+         json.dumps({"cost_usd": 0.01}), None)
+        for i in range(6000)
+    ]
+    store._conn.executemany("INSERT INTO spans VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    store._conn.commit()
+    store.close()
+
+    app.config["DB_PATH"] = path
+    with app.test_client() as c:
+        data = c.get("/api/stats").get_json()
+
+    assert data == {
+        "total_spans": 6000,
+        "total_runs": 600,
+        "error_count": 858,
+        "avg_latency_ms": 100.0,
+        "total_cost_usd": 60.0,
+    }

@@ -63,6 +63,37 @@ def test_limit_respected(store):
     assert len(rows) == 3
 
 
+def test_stats_on_empty_store(store):
+    assert store.stats() == {
+        "total_spans": 0, "total_runs": 0, "error_count": 0,
+        "avg_latency_ms": 0, "total_cost_usd": 0,
+    }
+
+
+def test_stats_aggregates_every_span(store):
+    from oracle.tracer import Span
+
+    def add(i, kind="llm_call", status="ok", duration_s=0.1, attrs=None):
+        store.save_span(Span(
+            span_id=f"s{i}", name="op", start_time=1_000.0 + i,
+            end_time=None if duration_s is None else 1_000.0 + i + duration_s,
+            trace_id="t", kind=kind, status=status, attributes=attrs or {},
+        ))
+
+    add(0, kind="agent_run", attrs={"cost_usd": 0.25})
+    add(1, status="error", duration_s=0.3, attrs={"cost_usd": 0.5})
+    add(2, duration_s=None)  # unfinished: no duration, must not skew the average
+    add(3, attrs={"tool": "search"})  # no cost
+
+    assert store.stats() == {
+        "total_spans": 4,
+        "total_runs": 1,
+        "error_count": 1,
+        "avg_latency_ms": 166.67,  # mean of 100, 300 and 100 ms
+        "total_cost_usd": 0.75,
+    }
+
+
 def _make_span(i: int):
     from oracle.tracer import Span
 

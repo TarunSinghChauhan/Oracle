@@ -101,6 +101,33 @@ class TraceStore:
             rows.append(d)
         return rows
 
+    def stats(self) -> dict:
+        """Totals over every stored span, not just the newest page of them."""
+        with self._lock:
+            total, runs, errors, avg_latency = self._conn.execute(
+                "SELECT COUNT(*),"
+                " COALESCE(SUM(kind = 'agent_run'), 0),"
+                " COALESCE(SUM(status = 'error'), 0),"
+                " AVG(duration_ms)"
+                " FROM spans"
+            ).fetchone()
+            attribute_rows = self._conn.execute(
+                "SELECT attributes FROM spans WHERE attributes LIKE '%cost_usd%'"
+            ).fetchall()
+
+        cost = 0.0
+        for (raw,) in attribute_rows:
+            value = json.loads(raw).get("cost_usd")
+            if value is not None:
+                cost += value
+        return {
+            "total_spans": total,
+            "total_runs": runs,
+            "error_count": errors,
+            "avg_latency_ms": round(avg_latency, 2) if avg_latency is not None else 0,
+            "total_cost_usd": round(cost, 4),
+        }
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

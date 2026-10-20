@@ -13,7 +13,6 @@ Then open http://127.0.0.1:5050
 from __future__ import annotations
 
 import argparse
-import statistics
 import sys
 from pathlib import Path
 
@@ -40,30 +39,10 @@ def index():
 @app.route("/api/stats")
 def api_stats():
     store = get_store()
-    spans = store.get_spans(limit=5000)
-    store.close()
-
-    if not spans:
-        return jsonify({
-            "total_spans": 0, "total_runs": 0, "error_count": 0,
-            "avg_latency_ms": 0, "total_cost_usd": 0,
-        })
-
-    runs = [s for s in spans if s["kind"] == "agent_run"]
-    errors = [s for s in spans if s["status"] == "error"]
-    durations = [s["duration_ms"] for s in spans if s["duration_ms"] is not None]
-    costs = [
-        s["attributes"].get("cost_usd", 0) for s in spans
-        if s["attributes"].get("cost_usd") is not None
-    ]
-
-    return jsonify({
-        "total_spans": len(spans),
-        "total_runs": len(runs),
-        "error_count": len(errors),
-        "avg_latency_ms": round(statistics.mean(durations), 2) if durations else 0,
-        "total_cost_usd": round(sum(costs), 4),
-    })
+    try:
+        return jsonify(store.stats())
+    finally:
+        store.close()
 
 
 @app.route("/api/spans")
