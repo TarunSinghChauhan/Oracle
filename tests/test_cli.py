@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from oracle.anomaly import AnomalyDetector
-from oracle.cli import main
+from oracle.cli import _watch, build_parser, main
 from oracle.storage import TraceStore
 from oracle.tracer import Span
 
@@ -112,3 +112,114 @@ def test_python_dash_m_oracle_scan_runs(spiky_db):
     )
     assert result.returncode == 1
     assert "latency_spike" in result.stdout
+
+
+def _watch_args(db, **overrides):
+    args = build_parser().parse_args(["scan", db, "--watch", "1"])
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_watch_alerts_once_for_a_persisting_anomaly(spiky_db, capsys):
+    assert _watch(_watch_args(spiky_db), sleep=lambda _: None, max_scans=3) == 0
+    out = capsys.readouterr().out
+    assert out.count("latency_spike") == 1
+
+
+def test_watch_alerts_again_when_a_new_anomaly_appears(spiky_db, capsys):
+    def add_second_spike(_seconds):
+        store = TraceStore(spiky_db)
+        _save(store, 11, duration_ms=100_000.0)
+        store.close()
+
+    calls = []
+
+    def sleep(seconds):
+        calls.append(seconds)
+        if len(calls) == 1:
+            add_second_spike(seconds)
+
+    assert _watch(_watch_args(spiky_db), sleep=sleep, max_scans=3) == 0
+    out = capsys.readouterr().out
+    assert out.count("latency_spike") == 2
+    assert calls == [1.0, 1.0]
+
+
+def test_watch_does_not_realert_an_ongoing_error_burst(tmp_path, capsys):
+    path = str(tmp_path / "burst.db")
+    store = TraceStore(path)
+    for i in range(10):
+        _save(store, i, status="error" if i >= 3 else "ok")
+    store.close()
+
+    def add_another_error(_seconds):
+        s = TraceStore(path)
+        _save(s, 100, status="error")  # a new newest span: the burst continues
+        s.close()
+
+    assert _watch(_watch_args(path), sleep=add_another_error, max_scans=3) == 0
+    assert capsys.readouterr().out.count("error_burst") == 1
+
+
+def test_watch_webhook_posts_only_new_anomalies(spiky_db, capsys):
+    args = _watch_args(spiky_db, webhook="https://hooks.example.com/x")
+    with patch("oracle.alerts.urllib.request.urlopen") as urlopen:
+        urlopen.return_value.__enter__.return_value.status = 200
+        assert _watch(args, sleep=lambda _: None, max_scans=3) == 0
+
+    assert urlopen.call_count == 1
+    assert capsys.readouterr().out.count("Sent 1 of 1 new alerts") == 1
+
+
+def test_watch_stays_quiet_when_nothing_is_wrong(healthy_db, capsys):
+    assert _watch(_watch_args(healthy_db), sleep=lambda _: None, max_scans=2) == 0
+    out = capsys.readouterr().out
+    assert "Watching" in out
+    assert "No anomalies" not in out and "latency_spike" not in out
+
+
+def test_watch_stops_cleanly_on_ctrl_c(healthy_db, capsys):
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    assert _watch(_watch_args(healthy_db), sleep=interrupt) == 0
+    assert "Stopped." in capsys.readouterr().out
+
+
+def test_watch_reports_a_database_that_disappears(tmp_path, capsys):
+    path = tmp_path / "gone.db"
+    store = TraceStore(str(path))
+    store.close()
+
+    def delete_db(_seconds):
+        path.unlink()
+
+    assert _watch(_watch_args(str(path)), sleep=delete_db, max_scans=5) == 2
+    assert "no such trace database" in capsys.readouterr().err
+    assert not path.exists()
+
+
+def test_watch_missing_database_is_an_error(tmp_path, capsys):
+    assert main(["scan", str(tmp_path / "nope.db"), "--watch", "1"]) == 2
+    assert "no such trace database" in capsys.readouterr().err
+
+
+def test_main_watch_runs_until_interrupted(healthy_db, capsys):
+    with patch("oracle.cli.time.sleep", side_effect=KeyboardInterrupt):
+        assert main(["scan", healthy_db, "--watch", "0.5"]) == 0
+    out = capsys.readouterr().out
+    assert "every 0.5s" in out and "Stopped." in out
+
+
+@pytest.mark.parametrize("seconds", ["0", "-3", "soon"])
+def test_watch_interval_must_be_a_positive_number(healthy_db, seconds):
+    with pytest.raises(SystemExit) as exc:
+        main(["scan", healthy_db, "--watch", seconds])
+    assert exc.value.code == 2
+
+
+def test_watch_cannot_be_combined_with_fail_on(healthy_db):
+    with pytest.raises(SystemExit) as exc:
+        main(["scan", healthy_db, "--watch", "5", "--fail-on", "warning"])
+    assert exc.value.code == 2
