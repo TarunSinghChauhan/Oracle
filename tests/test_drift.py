@@ -1,3 +1,6 @@
+import random
+import time
+
 from oracle.drift import DriftDetector, jaccard_similarity
 
 
@@ -85,3 +88,123 @@ def test_detector_flags_output_that_goes_empty():
     assert result is not None
     assert result.severity == "critical"
     assert result.similarity == 0.0
+
+
+class ListStore:
+    """Minimal stand-in for TraceStore: scan() only calls get_spans()."""
+
+    def __init__(self, spans):
+        self.spans = spans  # newest first, like TraceStore.get_spans
+
+    def get_spans(self, kind=None, limit=1000):
+        spans = [s for s in self.spans if kind is None or s["kind"] == kind]
+        return spans[:limit]
+
+
+def _span(i, output, name="summarize", kind="llm_call"):
+    attrs = {} if output is None else {"output": output}
+    return {"span_id": f"s{i}", "name": name, "kind": kind, "attributes": attrs}
+
+
+def _store(outputs, **kw):
+    """Spans numbered oldest (0) to newest, stored newest first."""
+    return ListStore([_span(i, o, **kw) for i, o in reversed(list(enumerate(outputs)))])
+
+
+STEADY = "the quarterly report shows steady revenue growth across all regions this year"
+BROKEN = "error upstream service unavailable please retry the request later today"
+
+
+def test_scan_flags_a_sudden_change_in_output():
+    found = DriftDetector().scan(_store([STEADY] * 5 + [BROKEN]))
+
+    assert [(a.kind, a.span_id, a.severity) for a in found] == [("drift", "s5", "critical")]
+    assert found[0].value == 0.0
+    assert found[0].baseline == 1.0
+    assert "diverged from recent baseline" in found[0].message
+
+
+def test_scan_is_quiet_for_consistent_outputs():
+    assert DriftDetector().scan(_store([STEADY] * 8)) == []
+
+
+def test_scan_skips_spans_without_text_output():
+    outputs = [STEADY, None, STEADY, STEADY, None, STEADY, BROKEN]
+    found = DriftDetector().scan(_store(outputs))
+    assert [a.span_id for a in found] == ["s6"]
+    # No output at all means nothing to compare.
+    assert DriftDetector().scan(_store([None] * 10)) == []
+
+
+def test_scan_handles_an_empty_store():
+    assert DriftDetector().scan(_store([])) == []
+
+
+def test_scan_respects_the_kind_filter():
+    store = _store([STEADY] * 5 + [BROKEN], kind="tool_call")
+    assert DriftDetector().scan(store, kind="llm_call") == []
+    assert len(DriftDetector().scan(store, kind="tool_call")) == 1
+
+
+def test_scan_keeps_a_separate_history_per_span_name():
+    spans = []
+    for i in range(6):  # interleave two names; only "b" changes at the end
+        spans.append(_span(2 * i, STEADY, name="a"))
+        spans.append(_span(2 * i + 1, STEADY if i < 5 else BROKEN, name="b"))
+    found = DriftDetector().scan(ListStore(list(reversed(spans))))
+    assert [(a.span_id) for a in found] == ["s11"]
+
+
+def test_scan_reports_newest_first():
+    found = DriftDetector(window=4).scan(_store([STEADY] * 4 + [BROKEN] + [STEADY] * 4 + [BROKEN]))
+    assert [a.span_id for a in found] == sorted((a.span_id for a in found), key=lambda s: -int(s[1:]))
+    assert len(found) >= 2
+
+
+def test_scan_does_not_use_or_change_the_detectors_own_history():
+    detector = DriftDetector()
+    detector.check("live", "summarize", STEADY)
+    before = {k: list(v) for k, v in detector._history.items()}
+
+    first = detector.scan(_store([STEADY] * 5 + [BROKEN]))
+    second = detector.scan(_store([STEADY] * 5 + [BROKEN]))
+
+    assert first == second and len(first) == 1
+    assert detector._history == before
+
+
+def test_scan_matches_feeding_check_one_output_at_a_time():
+    rng = random.Random(5)
+    calm = "revenue growth steady across regions while costs remained flat this quarter".split()
+    odd = "unexpected failure retry later upstream timeout gateway refused connection".split()
+    outputs = [" ".join(rng.choices(calm if rng.random() < 0.8 else odd, k=14)) for _ in range(150)]
+    names = [rng.choice(["a", "b", "c"]) for _ in outputs]
+    spans = [_span(i, o, name=n) for i, (o, n) in enumerate(zip(outputs, names))]
+
+    reference = DriftDetector()
+    expected = []
+    for span in spans:
+        result = reference.check(span["span_id"], span["name"], span["attributes"]["output"])
+        if result:
+            expected.append((span["span_id"], result.severity, result.message))
+
+    found = DriftDetector().scan(ListStore(list(reversed(spans))))
+    assert expected, "fixture should produce some drift"
+    assert [(a.span_id, a.severity, a.message) for a in reversed(found)] == expected
+
+
+def test_similarity_is_symmetric():
+    a, b = "one two three four five", "three four five six seven"
+    assert jaccard_similarity(a, b) == jaccard_similarity(b, a)
+
+
+def test_scan_cost_stays_low_for_many_outputs():
+    # Recomputing every pairwise similarity from scratch took about 3.4s for
+    # 2000 outputs; with cached shingles and pairs it takes a fraction of a second.
+    rng = random.Random(1)
+    vocab = "the quarterly report shows revenue growth across regions while costs flat".split()
+    outputs = [" ".join(rng.choices(vocab, k=60)) for _ in range(2000)]
+
+    started = time.perf_counter()
+    DriftDetector().scan(_store(outputs))
+    assert time.perf_counter() - started < 2.0

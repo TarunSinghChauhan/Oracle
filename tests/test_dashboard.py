@@ -93,3 +93,24 @@ def test_stats_count_every_span_not_just_the_newest_page(tmp_path):
         "avg_latency_ms": 100.0,
         "total_cost_usd": 60.0,
     }
+
+
+def test_anomalies_endpoint_includes_output_drift(tmp_path):
+    path = str(tmp_path / "drift.db")
+    store = TraceStore(path)
+    tracer = Tracer(store=store)
+    steady = "the quarterly report shows steady revenue growth across all regions this year"
+    broken = "error upstream service unavailable please retry the request later today"
+    for i in range(6):
+        with tracer.span("summarize", kind="llm_call",
+                         attributes={"output": broken if i == 5 else steady}):
+            pass
+    store.close()
+
+    app.config["DB_PATH"] = path
+    with app.test_client() as c:
+        data = c.get("/api/anomalies").get_json()
+
+    drift = [a for a in data if a["kind"] == "drift"]
+    assert len(drift) == 1
+    assert drift[0]["severity"] == "critical"

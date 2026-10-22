@@ -21,7 +21,7 @@ from flask import Flask, jsonify, render_template
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from oracle.storage import TraceStore
-from oracle.anomaly import AnomalyDetector
+from oracle.scan import scan_all
 
 app = Flask(__name__)
 app.config["DB_PATH"] = "oracle_traces.db"
@@ -56,8 +56,7 @@ def api_spans():
 @app.route("/api/anomalies")
 def api_anomalies():
     store = get_store()
-    detector = AnomalyDetector()
-    anomalies = detector.scan(store)
+    anomalies = scan_all(store)
     store.close()
     return jsonify([
         {

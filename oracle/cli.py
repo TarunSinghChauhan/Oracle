@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from oracle.alerts import AlertManager, ConsoleSink, WebhookSink
-from oracle.anomaly import Anomaly, AnomalyDetector
+from oracle.anomaly import Anomaly
+from oracle.scan import scan_all
 from oracle.storage import TraceStore
 
 SEVERITY_RANK = {"warning": 1, "critical": 2}
@@ -72,7 +73,7 @@ def _db_exists(path: str) -> bool:
 def _find_anomalies(args: argparse.Namespace) -> list[Anomaly]:
     store = TraceStore(args.db)
     try:
-        return AnomalyDetector().scan(store, kind=args.kind)
+        return scan_all(store, kind=args.kind)
     finally:
         store.close()
 
