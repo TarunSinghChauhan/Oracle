@@ -14,9 +14,12 @@ swap, or upstream data drift.
 
 from __future__ import annotations
 
+import functools
 import statistics
 from dataclasses import dataclass
 from typing import Optional
+
+from oracle.anomaly import Anomaly
 
 
 @dataclass
@@ -29,22 +32,33 @@ class DriftResult:
     message: str
 
 
+@functools.lru_cache(maxsize=1024)
 def _shingles(text: str, n: int = 3) -> set[str]:
-    """Word n-grams — robust to word order/length changes better than raw word sets."""
+    """Word n-grams — robust to word order/length changes better than raw word sets.
+
+    Cached: the same recent outputs are compared again and again as the window
+    slides. Callers must treat the returned set as read-only.
+    """
     words = text.lower().split()
     if len(words) < n:
         return {" ".join(words)} if words else set()
     return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
 
 
-def jaccard_similarity(a: str, b: str) -> float:
-    """0.0 = no shared shingles, 1.0 = identical shingle sets."""
+@functools.lru_cache(maxsize=4096)
+def _similarity(a: str, b: str) -> float:
     sa, sb = _shingles(a), _shingles(b)
     if not sa and not sb:
         return 1.0
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
+
+
+def jaccard_similarity(a: str, b: str) -> float:
+    """0.0 = no shared shingles, 1.0 = identical shingle sets."""
+    # Symmetric, so order the pair to share one cache entry per combination.
+    return _similarity(a, b) if a <= b else _similarity(b, a)
 
 
 class DriftDetector:
@@ -107,3 +121,32 @@ class DriftDetector:
             history.pop(0)
 
         return result
+
+    def scan(self, store, kind: Optional[str] = None, limit: int = 2000) -> list[Anomaly]:
+        """
+        Check the stored spans for output drift and return it as anomalies.
+
+        Reads each span's ``attributes["output"]`` (spans without a text output
+        are skipped) oldest to newest, so every output is judged against the
+        ones before it. Uses a fresh history with this detector's settings, so
+        calling it neither depends on nor changes the detector's own state.
+        Newest first, like ``AnomalyDetector.scan``.
+        """
+        detector = DriftDetector(self.window, self.min_samples, self.drift_threshold)
+        found: list[Anomaly] = []
+        for span in reversed(store.get_spans(kind=kind, limit=limit)):
+            output = (span.get("attributes") or {}).get("output")
+            if not isinstance(output, str):
+                continue
+            result = detector.check(span["span_id"], span["name"], output)
+            if result:
+                found.append(Anomaly(
+                    span_id=result.span_id,
+                    kind="drift",
+                    severity=result.severity,
+                    message=result.message,
+                    value=result.similarity,
+                    baseline=result.baseline_similarity,
+                ))
+        found.reverse()
+        return found

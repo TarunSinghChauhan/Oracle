@@ -223,3 +223,22 @@ def test_watch_cannot_be_combined_with_fail_on(healthy_db):
     with pytest.raises(SystemExit) as exc:
         main(["scan", healthy_db, "--watch", "5", "--fail-on", "warning"])
     assert exc.value.code == 2
+
+
+def test_scan_reports_output_drift(tmp_path, capsys):
+    path = str(tmp_path / "drift.db")
+    store = TraceStore(path)
+    steady = "the quarterly report shows steady revenue growth across all regions this year"
+    broken = "error upstream service unavailable please retry the request later today"
+    for i in range(6):
+        start = 1_000.0 + i
+        store.save_span(Span(
+            span_id=f"s{i}", name="summarize", start_time=start, end_time=start + 0.1,
+            trace_id="t", kind="llm_call",
+            attributes={"output": broken if i == 5 else steady},
+        ))
+    store.close()
+
+    assert main(["scan", path, "--fail-on", "warning"]) == 1
+    out = capsys.readouterr().out
+    assert "drift" in out and "diverged from recent baseline" in out
