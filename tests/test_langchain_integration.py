@@ -230,3 +230,79 @@ def test_nested_llm_span_is_parented_to_chain_span(store):
     chain = store.get_spans(kind="agent_run")[0]
     llm = store.get_spans(kind="llm_call")[0]
     assert llm["parent_id"] == chain["span_id"]
+
+
+def test_output_is_not_captured_by_default(store):
+    handler = OracleCallbackHandler(Tracer(store=store))
+    FakeListChatModel(responses=["secret answer"]).invoke("hi", config={"callbacks": [handler]})
+
+    assert "output" not in store.get_spans(kind="llm_call")[0]["attributes"]
+
+
+def test_capture_output_stores_the_response_text(store):
+    handler = OracleCallbackHandler(Tracer(store=store), capture_output=True)
+    FakeListChatModel(responses=["hello there"]).invoke("hi", config={"callbacks": [handler]})
+
+    assert store.get_spans(kind="llm_call")[0]["attributes"]["output"] == "hello there"
+
+
+def test_captured_output_is_truncated(store):
+    handler = OracleCallbackHandler(Tracer(store=store), capture_output=True, max_output_chars=5)
+    FakeListChatModel(responses=["hello there"]).invoke("hi", config={"callbacks": [handler]})
+
+    assert store.get_spans(kind="llm_call")[0]["attributes"]["output"] == "hello"
+
+
+def test_capture_output_keeps_an_empty_response(store):
+    # An output that goes empty is itself drift worth seeing.
+    handler = OracleCallbackHandler(Tracer(store=store), capture_output=True)
+    FakeListChatModel(responses=[""]).invoke("hi", config={"callbacks": [handler]})
+
+    assert store.get_spans(kind="llm_call")[0]["attributes"]["output"] == ""
+
+
+def test_capture_output_ignores_responses_without_generations(store):
+    handler = OracleCallbackHandler(Tracer(store=store), capture_output=True)
+    for bad in (object(), type("R", (), {"generations": []})(), type("R", (), {"generations": [[]]})()):
+        handler.on_llm_start({"name": "m"}, ["p"], run_id=f"r{id(bad)}")
+        handler.on_llm_end(bad, run_id=f"r{id(bad)}")
+
+    spans = store.get_spans(kind="llm_call")
+    assert len(spans) == 3
+    assert all("output" not in s["attributes"] for s in spans)
+
+
+def test_capture_output_still_records_token_usage(store):
+    from types import SimpleNamespace
+
+    handler = OracleCallbackHandler(Tracer(store=store), capture_output=True)
+    handler.on_llm_start({"name": "m"}, ["p"], run_id="r1")
+    response = SimpleNamespace(
+        llm_output={"token_usage": {"total_tokens": 7}},
+        generations=[[SimpleNamespace(text="ok")]],
+    )
+    handler.on_llm_end(response, run_id="r1")
+
+    attrs = store.get_spans(kind="llm_call")[0]["attributes"]
+    assert attrs["tokens"] == 7 and attrs["output"] == "ok"
+
+
+def test_max_output_chars_must_be_positive():
+    with pytest.raises(ValueError):
+        OracleCallbackHandler(Tracer(), capture_output=True, max_output_chars=0)
+
+
+def test_captured_outputs_feed_drift_detection_end_to_end(store):
+    from oracle.scan import scan_all
+
+    steady = "the quarterly report shows steady revenue growth across all regions this year"
+    broken = "error upstream service unavailable please retry the request later today"
+    handler = OracleCallbackHandler(Tracer(store=store), capture_output=True)
+    llm = FakeListChatModel(responses=[steady] * 5 + [broken])
+
+    for _ in range(6):
+        llm.invoke("summarize", config={"callbacks": [handler]})
+
+    drift = [a for a in scan_all(store) if a.kind == "drift"]
+    assert len(drift) == 1
+    assert drift[0].severity == "critical"

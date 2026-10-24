@@ -20,6 +20,10 @@ Usage:
     handler = OracleCallbackHandler(tracer)
 
     chain.invoke({"input": "..."}, config={"callbacks": [handler]})
+
+Pass ``capture_output=True`` to also store each LLM response text on its span
+(``attributes["output"]``), which is what output drift detection reads. It is
+off by default because it writes model responses to the trace database.
 """
 
 from __future__ import annotations
@@ -49,8 +53,12 @@ class OracleCallbackHandler(BaseCallbackHandler):
     manually with `tracer.span(..., parent=...)`.
     """
 
-    def __init__(self, tracer: Tracer):
+    def __init__(self, tracer: Tracer, capture_output: bool = False, max_output_chars: int = 2000):
+        if max_output_chars < 1:
+            raise ValueError("max_output_chars must be at least 1")
         self.tracer = tracer
+        self.capture_output = capture_output
+        self.max_output_chars = max_output_chars
         self._open_spans: dict[UUID, Any] = {}  # run_id -> context manager
         self._spans: dict[UUID, Span] = {}       # run_id -> Span
 
@@ -97,7 +105,20 @@ class OracleCallbackHandler(BaseCallbackHandler):
             token_usage = usage.get("token_usage", {}) if isinstance(usage, dict) else {}
             if token_usage:
                 span.attributes["tokens"] = token_usage.get("total_tokens")
+            if self.capture_output:
+                text = self._output_text(response)
+                if text is not None:
+                    span.attributes["output"] = text[: self.max_output_chars]
         self._end(run_id)
+
+    @staticmethod
+    def _output_text(response) -> Optional[str]:
+        """Text of the first generation, or None if the response has none."""
+        try:
+            text = response.generations[0][0].text
+        except (AttributeError, IndexError, TypeError):
+            return None
+        return text if isinstance(text, str) else None
 
     def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs):
         self._end(run_id, error=error)
