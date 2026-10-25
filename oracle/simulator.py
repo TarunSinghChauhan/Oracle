@@ -22,8 +22,23 @@ LLM_MODELS = ["claude-sonnet", "claude-haiku", "gpt-4o-mini"]
 # while a demo run still finishes quickly.
 LATENCY_SCALE = 0.1
 
+# Simulated LLM outputs. Normal answers are one summary sentence with a varying
+# figure, so they stay lexically close to each other; a drifted answer is a
+# refusal or error message instead, like a broken prompt or a silent model swap.
+NORMAL_OUTPUT = (
+    "summary: revenue grew {pct} percent this quarter across all regions "
+    "with stable margins and no major risks to report"
+)
+DRIFTED_OUTPUTS = (
+    "i am sorry but i cannot help with that request right now please try again later",
+    "error: the upstream model returned an empty response, retry the request",
+    "as an ai language model i am unable to provide that information",
+)
 
-def _simulate_llm_call(tracer: Tracer, parent, inject_anomaly: bool = False):
+
+def _simulate_llm_call(
+    tracer: Tracer, parent, inject_anomaly: bool = False, inject_drift: bool = False
+):
     base_latency = random.uniform(0.05, 0.25)
     base_cost = random.uniform(0.001, 0.01)
     if inject_anomaly:
@@ -38,6 +53,11 @@ def _simulate_llm_call(tracer: Tracer, parent, inject_anomaly: bool = False):
             "model": random.choice(LLM_MODELS),
             "tokens": random.randint(100, 2000),
             "cost_usd": round(base_cost, 5),
+            "output": (
+                random.choice(DRIFTED_OUTPUTS)
+                if inject_drift
+                else NORMAL_OUTPUT.format(pct=random.randint(2, 9))
+            ),
         },
     ):
         time.sleep(base_latency * LATENCY_SCALE)
@@ -60,16 +80,24 @@ def generate_traces(
     num_runs: int = 50,
     anomaly_rate: float = 0.08,
     error_rate: float = 0.05,
+    drift_rate: float = 0.05,
 ) -> None:
-    """Populate `store` with `num_runs` synthetic agent runs."""
+    """Populate `store` with `num_runs` synthetic agent runs.
+
+    `drift_rate` is the chance that a run's first LLM answer drifts (an error or
+    refusal instead of the usual summary), for output drift detection to catch.
+    """
     for i in range(num_runs):
         tracer = Tracer(store=store)
         inject_anomaly = random.random() < anomaly_rate
         force_error = random.random() < error_rate
+        inject_drift = random.random() < drift_rate
 
         try:
             with tracer.span("agent_run", kind="agent_run", attributes={"run_index": i}) as run:
-                _simulate_llm_call(tracer, run, inject_anomaly=inject_anomaly)
+                _simulate_llm_call(
+                    tracer, run, inject_anomaly=inject_anomaly, inject_drift=inject_drift
+                )
                 for _ in range(random.randint(1, 3)):
                     try:
                         _simulate_tool_call(tracer, run, force_error=force_error and random.random() < 0.3)
