@@ -209,6 +209,14 @@ async function fetchJSON(url) {
   return res.json();
 }
 
+// Span names, kinds and anomaly messages come from traced data (LangChain run
+// names, tool names, ...), so they must never be inserted into the page as HTML.
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, c => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
+  ));
+}
+
 function renderStats(s) {
   const el = document.getElementById('stats');
   el.innerHTML = `
@@ -229,10 +237,10 @@ function renderSpans(spans) {
   el.innerHTML = spans.slice(0, 30).map(s => `
     <div class="row">
       <div>
-        <div class="row-name">${s.name} <span class="row-meta">[${s.kind}]</span></div>
+        <div class="row-name">${esc(s.name)} <span class="row-meta">[${esc(s.kind)}]</span></div>
         <div class="row-meta">${s.duration_ms ? s.duration_ms.toFixed(1) + 'ms' : '—'}</div>
       </div>
-      <div class="badge ${s.status}">${s.status}</div>
+      <div class="badge ${esc(s.status)}">${esc(s.status)}</div>
     </div>
   `).join('');
 }
@@ -246,10 +254,10 @@ function renderAnomalies(anomalies) {
   el.innerHTML = anomalies.map(a => `
     <div class="anomaly-row">
       <div class="anomaly-top">
-        <span class="row-meta">${a.kind}</span>
-        <span class="severity ${a.severity}">${a.severity}</span>
+        <span class="row-meta">${esc(a.kind)}</span>
+        <span class="severity ${esc(a.severity)}">${esc(a.severity)}</span>
       </div>
-      <div class="anomaly-msg">${a.message}</div>
+      <div class="anomaly-msg">${esc(a.message)}</div>
     </div>
   `).join('');
 }

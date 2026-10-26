@@ -114,3 +114,42 @@ def test_anomalies_endpoint_includes_output_drift(tmp_path):
     drift = [a for a in data if a["kind"] == "drift"]
     assert len(drift) == 1
     assert drift[0]["severity"] == "critical"
+
+
+# Interpolations in the page script that are numbers or fixed strings computed
+# from the stats payload, so they cannot carry markup. Anything else that is
+# put into innerHTML must go through esc().
+SAFE_UNESCAPED = {
+    "s.total_spans",
+    "s.total_runs",
+    "s.error_count",
+    "s.error_count > 0 ? 'warn' : ''",
+    "s.avg_latency_ms",
+    "s.total_cost_usd",
+    "s.duration_ms ? s.duration_ms.toFixed(1) + 'ms' : '\u2014'",
+}
+
+
+def _template_script():
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parents[1] / "dashboard" / "templates" / "index.html").read_text()
+    return html.split("<script>", 1)[1].split("</script>", 1)[0]
+
+
+def test_template_escapes_every_text_field():
+    # Span names, kinds, statuses and anomaly messages come from traced data and
+    # were inserted into the page with innerHTML unescaped (stored XSS).
+    import re
+
+    script = _template_script()
+    assert "function esc(" in script
+    expressions = re.findall(r"\$\{([^}]*)\}", script)
+    unescaped = {e.strip() for e in expressions if not e.strip().startswith("esc(")}
+    assert unescaped <= SAFE_UNESCAPED, f"unescaped interpolations: {unescaped - SAFE_UNESCAPED}"
+
+    escaped = {e.strip() for e in expressions if e.strip().startswith("esc(")}
+    assert escaped == {
+        "esc(s.name)", "esc(s.kind)", "esc(s.status)",
+        "esc(a.kind)", "esc(a.severity)", "esc(a.message)",
+    }
