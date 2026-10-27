@@ -128,6 +128,31 @@ class TraceStore:
             "total_cost_usd": round(cost, 4),
         }
 
+    def prune(self, before: float, dry_run: bool = False) -> int:
+        """
+        Delete spans that started before `before` (a Unix timestamp) and return
+        how many. With ``dry_run`` nothing is deleted, only counted.
+
+        Spans are pruned one by one by start time, not by trace: a Tracer keeps
+        one trace id for its whole lifetime, so a long-running agent would
+        otherwise never become old enough to prune.
+        """
+        with self._lock:
+            if dry_run:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM spans WHERE start_time < ?", (before,)
+                ).fetchone()
+                return row[0]
+            cur = self._conn.execute("DELETE FROM spans WHERE start_time < ?", (before,))
+            self._conn.commit()
+            return cur.rowcount
+
+    def vacuum(self) -> None:
+        """Give the space freed by prune() back to the file system."""
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

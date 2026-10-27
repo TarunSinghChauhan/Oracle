@@ -1,7 +1,9 @@
 import os
 import subprocess
+import sqlite3
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 
 import pytest
@@ -242,3 +244,151 @@ def test_scan_reports_output_drift(tmp_path, capsys):
     assert main(["scan", path, "--fail-on", "warning"]) == 1
     out = capsys.readouterr().out
     assert "drift" in out and "diverged from recent baseline" in out
+
+
+HOUR = 3600.0
+DAY = 24 * HOUR
+
+
+def _db_with_ages(tmp_path, ages_in_seconds, name="age.db"):
+    """A database with one span per age (seconds before now)."""
+    path = str(tmp_path / name)
+    store = TraceStore(path)
+    now = time.time()
+    for i, age in enumerate(ages_in_seconds):
+        start = now - age
+        store.save_span(Span(
+            span_id=f"a{i}", name="op", start_time=start, end_time=start + 0.1,
+            trace_id="t", kind="llm_call", attributes={},
+        ))
+    store.close()
+    return path
+
+
+def _span_count(path):
+    store = TraceStore(path)
+    try:
+        return store.stats()["total_spans"]
+    finally:
+        store.close()
+
+
+def test_prune_deletes_old_spans_and_reports_it(tmp_path, capsys):
+    path = _db_with_ages(tmp_path, [10 * DAY, 8 * DAY, HOUR])
+
+    assert main(["prune", path, "--older-than", "7d"]) == 0
+
+    assert "Deleted 2 spans older than 7d; 1 kept." in capsys.readouterr().out
+    assert _span_count(path) == 1
+
+
+def test_prune_dry_run_changes_nothing(tmp_path, capsys):
+    path = _db_with_ages(tmp_path, [10 * DAY, 8 * DAY, HOUR])
+
+    assert main(["prune", path, "--older-than", "7d", "--dry-run"]) == 0
+
+    assert "Would delete 2 spans older than 7d (dry run, nothing changed)." in capsys.readouterr().out
+    assert _span_count(path) == 3
+
+
+def test_prune_with_nothing_old_says_so(tmp_path, capsys):
+    path = _db_with_ages(tmp_path, [HOUR, 2 * HOUR, 3 * HOUR])
+
+    assert main(["prune", path, "--older-than", "7d"]) == 0
+
+    assert "No spans older than 7d; 3 kept." in capsys.readouterr().out
+    assert _span_count(path) == 3
+
+
+@pytest.mark.parametrize("age, deleted", [("90m", 1), ("1.5h", 1), ("5400s", 1), ("2h", 0)])
+def test_prune_accepts_common_duration_spellings(tmp_path, age, deleted):
+    # One span is 1h59m old, the other 30m old: all three 90-minute spellings
+    # delete only the older one, while "2h" is not old enough to delete anything.
+    path = _db_with_ages(tmp_path, [2 * HOUR - 60, 30 * 60])
+
+    assert main(["prune", path, "--older-than", age]) == 0
+
+    assert _span_count(path) == 2 - deleted
+
+
+def test_prune_accepts_the_equals_form(tmp_path, capsys):
+    path = _db_with_ages(tmp_path, [3 * DAY])
+    assert main(["prune", path, "--older-than=2d"]) == 0
+    assert "Deleted 1 spans older than 2d" in capsys.readouterr().out
+
+
+def test_prune_frees_disk_space(tmp_path):
+    path = str(tmp_path / "big.db")
+    store = TraceStore(path)
+    rows = [
+        (f"p{i}", "t", None, "op", "tool_call", "ok", 1_000.0 + i, 1_000.1 + i, 100.0,
+         '{"pad": "' + "x" * 500 + '"}', None)
+        for i in range(3000)
+    ]
+    store._conn.executemany("INSERT INTO spans VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    store._conn.commit()
+    store.close()
+    before = os.path.getsize(path)
+
+    assert main(["prune", path, "--older-than", "1d"]) == 0
+
+    assert os.path.getsize(path) < before / 4
+
+
+def test_prune_reports_a_locked_database_instead_of_crashing(tmp_path, capsys):
+    path = _db_with_ages(tmp_path, [3 * DAY])
+    locked = sqlite3.OperationalError("database is locked")
+
+    with patch.object(TraceStore, "prune", side_effect=locked):
+        assert main(["prune", path, "--older-than", "1d"]) == 1
+
+    err = capsys.readouterr().err
+    assert "could not prune" in err and "database is locked" in err
+    assert _span_count(path) == 1
+
+
+def test_prune_warns_when_only_the_shrink_step_fails(tmp_path, capsys):
+    path = _db_with_ages(tmp_path, [3 * DAY, HOUR])
+    locked = sqlite3.OperationalError("database is locked")
+
+    with patch.object(TraceStore, "vacuum", side_effect=locked):
+        assert main(["prune", path, "--older-than", "1d"]) == 0
+
+    captured = capsys.readouterr()
+    assert "Deleted 1 spans older than 1d; 1 kept." in captured.out
+    assert "could not be shrunk" in captured.err
+    assert _span_count(path) == 1
+
+
+def test_prune_missing_database_is_an_error_and_is_not_created(tmp_path, capsys):
+    missing = tmp_path / "nope.db"
+    assert main(["prune", str(missing), "--older-than", "7d"]) == 2
+    assert "no such trace database" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("age", ["7", "d", "0d", "-1d", "1w", "soon", "", "1d2h"])
+def test_prune_rejects_invalid_durations(tmp_path, age):
+    path = _db_with_ages(tmp_path, [DAY])
+    with pytest.raises(SystemExit) as exc:
+        main(["prune", path, "--older-than", age])
+    assert exc.value.code == 2
+    assert _span_count(path) == 1
+
+
+def test_prune_requires_older_than(tmp_path):
+    path = _db_with_ages(tmp_path, [DAY])
+    with pytest.raises(SystemExit) as exc:
+        main(["prune", path])
+    assert exc.value.code == 2
+    assert _span_count(path) == 1
+
+
+def test_python_dash_m_oracle_prune_runs(tmp_path):
+    path = _db_with_ages(tmp_path, [3 * DAY, HOUR])
+    result = subprocess.run(
+        [sys.executable, "-m", "oracle", "prune", path, "--older-than", "1d", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    assert "Would delete 1 spans older than 1d" in result.stdout
