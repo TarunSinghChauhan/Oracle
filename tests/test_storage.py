@@ -169,3 +169,58 @@ def test_reads_and_writes_can_overlap_across_threads(store):
         t.join()
 
     assert errors == []
+
+
+def _span_at(i: int, start_time: float, padding: int = 200):
+    from oracle.tracer import Span
+
+    return Span(
+        span_id=f"p{i}", name="op", start_time=start_time, end_time=start_time + 0.1,
+        trace_id="t", kind="tool_call", attributes={"pad": "x" * padding},
+    )
+
+
+def test_prune_deletes_only_older_spans(store):
+    for i, start in enumerate([100.0, 200.0, 300.0, 400.0]):
+        store.save_span(_span_at(i, start))
+
+    assert store.prune(300.0) == 2
+
+    # A span that started exactly at the cutoff is kept.
+    assert sorted(r["start_time"] for r in store.get_spans()) == [300.0, 400.0]
+
+
+def test_prune_dry_run_counts_without_deleting(store):
+    for i, start in enumerate([100.0, 200.0, 300.0]):
+        store.save_span(_span_at(i, start))
+
+    assert store.prune(250.0, dry_run=True) == 2
+    assert len(store.get_spans()) == 3
+
+
+def test_prune_with_nothing_old_returns_zero(store):
+    store.save_span(_span_at(0, 500.0))
+    assert store.prune(100.0) == 0
+    assert len(store.get_spans()) == 1
+
+
+def test_prune_on_empty_store(store):
+    assert store.prune(1_000.0) == 0
+    assert store.prune(1_000.0, dry_run=True) == 0
+
+
+def test_vacuum_gives_space_back_to_the_file_system(store):
+    rows = [
+        (f"p{i}", "t", None, "op", "tool_call", "ok", float(i), float(i) + 0.1, 100.0,
+         '{"pad": "' + "x" * 500 + '"}', None)
+        for i in range(3000)
+    ]
+    store._conn.executemany("INSERT INTO spans VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    store._conn.commit()
+    before = os.path.getsize(store.db_path)
+
+    assert store.prune(1e9) == 3000
+    assert os.path.getsize(store.db_path) == before  # deleting alone does not shrink the file
+    store.vacuum()
+
+    assert os.path.getsize(store.db_path) < before / 4
