@@ -98,3 +98,20 @@ def test_alert_manager_counts_only_successful_sends():
 
     manager = AlertManager(sink=FlakySink())
     assert manager.dispatch([_mk_anomaly(), _mk_anomaly(), _mk_anomaly()]) == 2
+
+
+@pytest.mark.parametrize("url", [
+    "hooks.slack.com/services/T000/B000/xyz",
+    "file:///etc/hostname",
+    "ftp://example.com/hook",
+    "https://",
+    "",
+])
+def test_webhook_sink_rejects_urls_that_are_not_http(url):
+    with pytest.raises(ValueError, match="http"):
+        WebhookSink(url)
+
+
+@pytest.mark.parametrize("url", ["http://localhost:8080/h", "https://hooks.example.com/x"])
+def test_webhook_sink_accepts_http_and_https(url):
+    assert WebhookSink(url).webhook_url == url

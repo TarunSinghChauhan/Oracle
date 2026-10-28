@@ -392,3 +392,14 @@ def test_python_dash_m_oracle_prune_runs(tmp_path):
     )
     assert result.returncode == 0
     assert "Would delete 1 spans older than 1d" in result.stdout
+
+
+@pytest.mark.parametrize("url", ["hooks.slack.com/services/x", "file:///etc/hostname"])
+def test_webhook_without_a_scheme_is_a_usage_error(spiky_db, capsys, url):
+    with patch("oracle.alerts.urllib.request.urlopen") as urlopen:
+        with pytest.raises(SystemExit) as exc:
+            main(["scan", spiky_db, "--webhook", url])
+
+    assert exc.value.code == 2
+    assert "must start with http" in capsys.readouterr().err
+    urlopen.assert_not_called()

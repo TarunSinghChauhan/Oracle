@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from typing import Optional, Protocol
+from urllib.parse import urlparse
 
 from oracle.anomaly import Anomaly
 
@@ -31,11 +32,23 @@ class ConsoleSink:
         return True
 
 
+def check_webhook_url(url: str) -> str:
+    """Return ``url`` if it is an absolute http(s) URL, else raise ValueError.
+
+    urllib would otherwise raise from deep inside ``send`` for a URL with no
+    scheme, and quietly accept schemes such as ``file:`` or ``ftp:``.
+    """
+    parts = urlparse(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"webhook URL must start with http:// or https://: {url!r}")
+    return url
+
+
 class WebhookSink:
     """Posts a Slack-compatible JSON payload to any incoming webhook URL."""
 
     def __init__(self, webhook_url: str, timeout: float = 5.0):
-        self.webhook_url = webhook_url
+        self.webhook_url = check_webhook_url(webhook_url)
         self.timeout = timeout
 
     def send(self, anomaly: Anomaly) -> bool:
