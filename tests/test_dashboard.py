@@ -153,3 +153,70 @@ def test_template_escapes_every_text_field():
         "esc(s.name)", "esc(s.kind)", "esc(s.status)",
         "esc(a.kind)", "esc(a.severity)", "esc(a.message)",
     }
+
+
+def test_main_refuses_a_missing_database(tmp_path, capsys):
+    from unittest.mock import patch
+
+    from dashboard.app import main
+
+    missing = tmp_path / "typo.db"
+    with patch.object(app, "run") as run:
+        assert main(["--db", str(missing)]) == 2
+
+    assert "no such trace database" in capsys.readouterr().err
+    assert not missing.exists()  # no stray empty database
+    run.assert_not_called()
+
+
+def test_main_serves_an_existing_database(tmp_path, capsys):
+    from unittest.mock import patch
+
+    from dashboard.app import main
+
+    path = str(tmp_path / "ok.db")
+    TraceStore(path).close()
+    with patch.object(app, "run") as run:
+        assert main(["--db", path, "--port", "6123"]) == 0
+
+    run.assert_called_once_with(port=6123, debug=False)
+    assert app.config["DB_PATH"] == path
+    assert "http://127.0.0.1:6123" in capsys.readouterr().out
+
+
+def test_main_defaults_to_port_5050(tmp_path):
+    from unittest.mock import patch
+
+    from dashboard.app import main
+
+    path = str(tmp_path / "ok.db")
+    TraceStore(path).close()
+    with patch.object(app, "run") as run:
+        assert main(["--db", path]) == 0
+
+    run.assert_called_once_with(port=5050, debug=False)
+
+
+@pytest.mark.parametrize("route, failing", [
+    ("/api/stats", ("store", "stats")),
+    ("/api/spans", ("store", "get_spans")),
+    ("/api/anomalies", ("scan_all", None)),
+])
+def test_failing_requests_still_close_the_store(monkeypatch, route, failing):
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setitem(app.config, "TESTING", True)
+    store = MagicMock()
+    target, method = failing
+    if target == "store":
+        getattr(store, method).side_effect = RuntimeError("boom")
+    with patch("dashboard.app.get_store", return_value=store):
+        if target == "scan_all":
+            with patch("dashboard.app.scan_all", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError):
+                    app.test_client().get(route)
+        else:
+            with pytest.raises(RuntimeError):
+                app.test_client().get(route)
+
+    store.close.assert_called_once()

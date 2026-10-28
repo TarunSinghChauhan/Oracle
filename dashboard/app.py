@@ -48,16 +48,20 @@ def api_stats():
 @app.route("/api/spans")
 def api_spans():
     store = get_store()
-    spans = store.get_spans(limit=100)
-    store.close()
+    try:
+        spans = store.get_spans(limit=100)
+    finally:
+        store.close()
     return jsonify(spans)
 
 
 @app.route("/api/anomalies")
 def api_anomalies():
     store = get_store()
-    anomalies = scan_all(store)
-    store.close()
+    try:
+        anomalies = scan_all(store)
+    finally:
+        store.close()
     return jsonify([
         {
             "span_id": a.span_id,
@@ -71,17 +75,25 @@ def api_anomalies():
     ])
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="ORACLE dashboard")
     parser.add_argument("--db", default="oracle_traces.db", help="Path to trace store DB")
     parser.add_argument("--port", type=int, default=5050)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    # TraceStore creates a missing database on first use, so a mistyped path
+    # would start a dashboard that shows "no spans yet" and leave an empty file
+    # behind. Fail up front instead.
+    if not Path(args.db).is_file():
+        print(f"oracle: no such trace database: {args.db}", file=sys.stderr)
+        return 2
 
     app.config["DB_PATH"] = args.db
     print(f"ORACLE dashboard running at http://127.0.0.1:{args.port}")
     print(f"Reading traces from: {args.db}")
     app.run(port=args.port, debug=False)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
