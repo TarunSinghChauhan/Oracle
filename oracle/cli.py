@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Sequence
 
-from oracle.alerts import AlertManager, ConsoleSink, WebhookSink
+from oracle.alerts import AlertManager, ConsoleSink, WebhookSink, check_webhook_url
 from oracle.anomaly import Anomaly
 from oracle.scan import scan_all
 from oracle.storage import TraceStore
@@ -43,6 +43,13 @@ class Duration(NamedTuple):
     text: str  # as the user typed it, for messages
 
 
+def _webhook_url(text: str) -> str:
+    try:
+        return check_webhook_url(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _duration(text: str) -> Duration:
     """'90s', '15m', '12h', '7d' (decimals allowed, e.g. '1.5h')."""
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd])", text.strip().lower())
@@ -66,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--kind", help="only scan spans of this kind, e.g. llm_call")
     scan.add_argument(
-        "--webhook", metavar="URL",
+        "--webhook", type=_webhook_url, metavar="URL",
         help="post anomalies to this Slack-compatible webhook instead of printing",
     )
     scan.add_argument(
